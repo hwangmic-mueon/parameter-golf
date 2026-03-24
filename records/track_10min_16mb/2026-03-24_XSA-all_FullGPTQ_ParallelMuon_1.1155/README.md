@@ -47,13 +47,21 @@ Techniques tested on this stack that did not help:
 
 | Technique | BPP | Delta | Why |
 |-----------|-----|-------|-----|
-| Value Residual Learning | 1.1298 | +0.0012 | Conflicts with VE128 — both inject identity info into deep layers |
+| Value Residual Learning (linear) | 1.1298 | +0.0012 | Conflicts with VE128 — both inject identity info into deep layers |
+| VRL sigmoid gates + TrigramHash | 1.1174 | +0.0020 | Combined overhead costs ~100 steps, net negative |
 | Catalytic Residuals | 1.1285 | -0.0001 | Redundant with existing attn_scale/mlp_scale/resid_mix |
 | Backout Connection | 1.1291 | +0.0005 | Redundant with U-Net skip connections |
 | Gated Attention + XSA-all | 1.1279 | +0.0011 vs XSA-all | 3% step overhead outweighs quality gain |
-| Hadamard rotation + GPTQ | 1.1266 | -0.0002 | +0.5MB artifact size, pushes over 16MB |
-| Stride=32 eval | — | +0.0001 | No gain at seq2048. Not worth 2x eval time |
-| BigramHash(8192) | 1.1200 | -0.0068 | Artifact 0.37MB over 16MB budget |
+| Hadamard rotation + GPTQ | 1.1266 | -0.0002 | +0.5MB artifact size, hurts zstd compressibility |
+| TrigramHash (zero params) | 1.1237 | +0.0049 | Changes weight distribution, hurts compression |
+| BigramHash(8192) | 1.1200 | -0.0068 | Artifact 0.52MB over 16MB budget |
+| BigramHash(4096) | 1.1285 | +0.0097 | Artifact 0.52MB over budget, cold cache |
+| Stride=32 eval | — | +0.0001 | Negligible at seq2048. Stride=64 already gives 1984 context |
+| Temperature scaling (T≠1.0) | — | +0.0002 to +0.003 | Model already well-calibrated; T=1.0 optimal |
+| Extended context eval (seq4096) | 1.5695 | catastrophic | RoPE breaks completely beyond training length |
+| Checkpoint logit ensemble | — | infeasible | EMA-raw delta is 16.2MB compressed (int8+zstd) |
+| Entropy coding (ANS/Huffman) | — | +0.05MB max | lzma already at 99.7% of Shannon entropy limit |
+| Magnitude pruning (all ±1) | 1.1341 | +0.015 | Too aggressive — no smooth continuum between threshold=0 and threshold=1 |
 
 ## Credits
 
