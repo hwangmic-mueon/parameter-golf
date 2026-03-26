@@ -16,6 +16,7 @@ import time
 import uuid
 import zlib
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +32,10 @@ from mlx.utils import tree_flatten, tree_unflatten
 # ==============================================================================
 
 COMPUTE_DTYPE = mx.bfloat16
+SHARD_HEADER_INTS = 256
+SHARD_HEADER_DTYPE = np.dtype("<i4")
+SHARD_TOKEN_DTYPE = np.dtype("<u2")
+SHARD_HEADER_BYTES = SHARD_HEADER_INTS * SHARD_HEADER_DTYPE.itemsize
 
 # ==============================================================================
 # HYPERPARAMETERS
@@ -52,6 +57,7 @@ class Hyperparameters:
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
     # Validation always uses the full fineweb_val split.
     val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+    val_tokens_limit: int = int(os.environ.get("VAL_TOKENS_LIMIT", 0))
     train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
@@ -75,7 +81,15 @@ class Hyperparameters:
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
+    rope_dims: int = int(os.environ.get("ROPE_DIMS", 0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    ln_scale: bool = bool(int(os.environ.get("LN_SCALE", "0")))
+    activation: str = os.environ.get("ACTIVATION", "relu2")
+    bigram_vocab_size: int = int(os.environ.get("BIGRAM_VOCAB_SIZE", 0))
+    bigram_dim: int = int(os.environ.get("BIGRAM_DIM", 128))
+    trigram: bool = bool(int(os.environ.get("TRIGRAM", "0")))
+    smear_enabled: bool = bool(int(os.environ.get("SMEAR_ENABLED", "0")))
+    xsa_last_n: int = int(os.environ.get("XSA_LAST_N", 0))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -120,7 +134,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear.gate,bigram.scale",
     ).split(",")
     if pattern
 )
@@ -188,19 +202,29 @@ def zeropower_newtonschulz5(g: mx.array, steps: int, eps: float = 1e-7) -> mx.ar
     return x.astype(g.dtype)
 
 
-def load_data_shard(path: Path) -> np.ndarray:
-    header_bytes = 256 * np.dtype("<i4").itemsize
-    token_bytes = np.dtype("<u2").itemsize
-    header = np.fromfile(path, dtype="<i4", count=256)
-    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
+@dataclass
+class MappedShard:
+    path: Path
+    num_tokens: int
+    tokens_u16: np.memmap
+
+
+def open_data_shard(path: Path) -> MappedShard:
+    header = np.fromfile(path, dtype=SHARD_HEADER_DTYPE, count=SHARD_HEADER_INTS)
+    if header.size != SHARD_HEADER_INTS or int(header[0]) != 20240520 or int(header[1]) != 1:
         raise ValueError(f"Unexpected shard header for {path}")
     num_tokens = int(header[2])
-    if path.stat().st_size != header_bytes + num_tokens * token_bytes:
+    expected_size = SHARD_HEADER_BYTES + num_tokens * SHARD_TOKEN_DTYPE.itemsize
+    if path.stat().st_size != expected_size:
         raise ValueError(f"Shard size mismatch for {path}")
-    tokens = np.fromfile(path, dtype="<u2", count=num_tokens, offset=header_bytes)
-    if tokens.size != num_tokens:
-        raise ValueError(f"Short read for {path}")
-    return tokens.astype(np.int32, copy=False)
+    tokens = np.memmap(path, dtype=SHARD_TOKEN_DTYPE, mode="r", offset=SHARD_HEADER_BYTES, shape=(num_tokens,))
+    return MappedShard(path=path, num_tokens=num_tokens, tokens_u16=tokens)
+
+
+def load_data_shard(path: Path) -> np.ndarray:
+    # Validation still concatenates host arrays eagerly, but the training path uses
+    # persistent memmaps via TokenStream below.
+    return np.asarray(open_data_shard(path).tokens_u16, dtype=np.int32)
 
 
 # ==============================================================================
@@ -222,8 +246,11 @@ class TokenStream:
         self.file_idx = 0
         self.log_fn = log_fn
         self.dataset_name = dataset_name
-        self.tokens = load_data_shard(self.files[0])
+        self.shards = [open_data_shard(path) for path in self.files]
+        self.shard = self.shards[0]
+        self.tokens = self.shard.tokens_u16
         self.pos = 0
+        self._scratch: np.ndarray | None = None
 
     def next_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
@@ -234,20 +261,40 @@ class TokenStream:
                     f"WARNING: starting epoch:{self.epoch} "
                     f"dataset:{self.dataset_name} train_shards:{len(self.files)}"
                 )
-        self.tokens = load_data_shard(self.files[self.file_idx])
+        self.shard = self.shards[self.file_idx]
+        self.tokens = self.shard.tokens_u16
         self.pos = 0
 
-    def take(self, n: int) -> np.ndarray:
-        chunks: list[np.ndarray] = []
-        left = n
+    def _ensure_scratch(self, size: int) -> np.ndarray:
+        if self._scratch is None or self._scratch.size < size:
+            self._scratch = np.empty((size,), dtype=np.uint16)
+        return self._scratch
+
+    def take_window(self, usable_tokens: int) -> np.ndarray:
+        needed = usable_tokens + 1
+        if usable_tokens <= 0:
+            raise ValueError("usable_tokens must be positive")
+
+        # Common path: the whole training window sits inside one memmapped shard, so
+        # we return a direct view with no host-side stitch copy.
+        if self.pos + needed <= self.tokens.size:
+            start = self.pos
+            self.pos += needed
+            return self.tokens[start : start + needed]
+
+        # Boundary path: only copy the seam into a reusable scratch buffer.
+        scratch = self._ensure_scratch(needed)
+        written = 0
+        left = needed
         while left > 0:
             if self.pos >= self.tokens.size:
                 self.next_file()
             k = min(left, int(self.tokens.size - self.pos))
-            chunks.append(self.tokens[self.pos : self.pos + k])
+            scratch[written : written + k] = self.tokens[self.pos : self.pos + k]
             self.pos += k
+            written += k
             left -= k
-        return chunks[0] if len(chunks) == 1 else np.concatenate(chunks, axis=0)
+        return scratch[:needed]
 
 
 class TokenLoader:
@@ -263,10 +310,11 @@ class TokenLoader:
         usable = (batch_tokens // seq_len) * seq_len
         if usable <= 0:
             raise ValueError(f"token budget too small for seq_len={seq_len}")
-        chunk = self.stream.take(usable + 1)
+        chunk = self.stream.take_window(usable)
         x = chunk[:-1].reshape(-1, seq_len)
         y = chunk[1:].reshape(-1, seq_len)
-        return mx.array(x, dtype=mx.int32), mx.array(y, dtype=mx.int32)
+        # Keep tokens compact in host memory and cast inside the compiled model.
+        return mx.array(x, dtype=mx.uint16), mx.array(y, dtype=mx.uint16)
 
 
 # ==============================================================================
@@ -300,6 +348,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        rope_dims: int = 0,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -312,13 +361,31 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
+        if 0 < rope_dims < self.head_dim:
+            if rope_dims % 2 != 0:
+                raise ValueError(f"rope_dims must be even, got {rope_dims}")
+            self.rope_dims = rope_dims
+        else:
+            self.rope_dims = self.head_dim
         self.c_q = CastedLinear(dim, dim)
         self.c_k = CastedLinear(dim, kv_dim)
         self.c_v = CastedLinear(dim, kv_dim)
         self.proj = CastedLinear(dim, dim)
         self.q_gain = mx.ones((num_heads,), dtype=mx.float32) * qk_gain_init
-        self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
+        self.rope = nn.RoPE(self.rope_dims, traditional=False, base=rope_base)
         self.scale = self.head_dim ** -0.5
+        self.use_xsa = False
+
+    def apply_rope(self, x: mx.array) -> mx.array:
+        return self.rope(x)
+
+    def xsa_efficient(self, y: mx.array, v: mx.array) -> mx.array:
+        group = self.num_heads // self.num_kv_heads
+        y_g = y.reshape(y.shape[0], self.num_kv_heads, group, y.shape[2], y.shape[3])
+        v_norm = v * mx.rsqrt(mx.sum(v * v, axis=-1, keepdims=True) + 1e-6)
+        vn = mx.expand_dims(v_norm, axis=2)
+        proj = mx.sum(y_g * vn, axis=-1, keepdims=True) * vn
+        return (y_g - proj).reshape(y.shape)
 
     def __call__(self, x: mx.array) -> mx.array:
         bsz, seqlen, dim = x.shape
@@ -326,24 +393,82 @@ class CausalSelfAttention(nn.Module):
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
-        k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
+        q = self.apply_rope(rms_norm(q).astype(COMPUTE_DTYPE))
+        k = self.apply_rope(rms_norm(k).astype(COMPUTE_DTYPE))
         q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
+        if self.use_xsa:
+            y = self.xsa_efficient(y, v)
         y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
         return self.proj(y)
 
 
+class SmearGate(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate = mx.zeros((dim,), dtype=mx.float32)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        g = mx.sigmoid(self.gate.astype(x.dtype))[None, None, :]
+        x_prev = mx.concatenate((mx.zeros_like(x[:, :1]), x[:, :-1]), axis=1)
+        return (1.0 - g) * x + g * x_prev
+
+
+class BigramHashEmbedding(nn.Module):
+    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int, trigram: bool = False):
+        super().__init__()
+        if bigram_vocab_size < 2:
+            raise ValueError("bigram_vocab_size must be at least 2")
+        self.bigram_vocab_size = bigram_vocab_size
+        self.trigram = trigram
+        self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
+        self.embed.weight = mx.zeros_like(self.embed.weight)
+        self.proj = CastedLinear(bigram_dim, model_dim) if bigram_dim != model_dim else None
+        if self.proj is not None:
+            self.proj.weight = mx.zeros_like(self.proj.weight)
+        self.scale = mx.array(0.05, dtype=mx.float32)
+
+    def bigram_hash(self, tokens: mx.array) -> mx.array:
+        t = tokens.astype(mx.int32)
+        mod = self.bigram_vocab_size - 1
+        prefix = mx.full((t.shape[0], 1), mod, dtype=mx.int32)
+        body = mx.remainder(mx.bitwise_xor(36313 * t[:, 1:], 27191 * t[:, :-1]), mod)
+        return mx.concatenate((prefix, body), axis=1)
+
+    def trigram_hash(self, tokens: mx.array) -> mx.array:
+        t = tokens.astype(mx.int32)
+        mod = self.bigram_vocab_size - 1
+        prefix = mx.full((t.shape[0], 2), mod, dtype=mx.int32)
+        body = mx.remainder(
+            mx.bitwise_xor(mx.bitwise_xor(36313 * t[:, 2:], 27191 * t[:, 1:-1]), 51497 * t[:, :-2]),
+            mod,
+        )
+        return mx.concatenate((prefix, body), axis=1)
+
+    def __call__(self, token_ids: mx.array) -> mx.array:
+        h = self.embed(self.bigram_hash(token_ids))
+        if self.trigram:
+            h = h + self.embed(self.trigram_hash(token_ids))
+        if self.proj is not None:
+            h = self.proj(h)
+        return h * self.scale.astype(h.dtype)
+
+
 class MLP(nn.Module):
     # Baseline MLP uses relu^2 instead of GELU/SiLU. It is cheap and works well in this setup.
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, activation: str):
         super().__init__()
         hidden = dim * mlp_mult
         self.fc = CastedLinear(dim, hidden)
         self.proj = CastedLinear(hidden, dim)
+        self.activation = activation.lower()
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = nn.relu(self.fc(x))
+        x = self.fc(x)
+        if self.activation == "leakyrelu2":
+            x = mx.where(x >= 0, x, 0.5 * x)
+            return self.proj(x * x)
+        x = nn.relu(x)
         return self.proj(x * x)
 
 
@@ -356,22 +481,27 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        rope_dims: int = 0,
+        ln_scale: bool = False,
+        activation: str = "relu2",
+        layer_idx: int = 0,
     ):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dims=rope_dims)
+        self.mlp = MLP(dim, mlp_mult, activation=activation)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
+        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
     def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        attn_out = self.attn(self.attn_norm(x) * self.ln_scale_factor)
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x) * self.ln_scale_factor)
         return x
 
 
@@ -382,7 +512,9 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, rope_dims: int = 0, ln_scale: bool = False, activation: str = "relu2",
+                 bigram_vocab_size: int = 0, bigram_dim: int = 128, trigram: bool = False,
+                 smear_enabled: bool = False, xsa_last_n: int = 0):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -390,14 +522,34 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
+        self.bigram = (
+            BigramHashEmbedding(bigram_vocab_size, bigram_dim, dim, trigram=trigram)
+            if bigram_vocab_size > 0
+            else None
+        )
+        self.smear = SmearGate(dim) if smear_enabled else None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            Block(
+                dim,
+                num_heads,
+                num_kv_heads,
+                mlp_mult,
+                rope_base,
+                qk_gain_init,
+                rope_dims=rope_dims,
+                ln_scale=ln_scale,
+                activation=activation,
+                layer_idx=i,
+            )
             for i in range(num_layers)
         ]
+        if xsa_last_n > 0:
+            for i in range(max(0, num_layers - xsa_last_n), num_layers):
+                self.blocks[i].attn.use_xsa = True
         self.final_norm = RMSNormNoWeight()
 
         for b in self.blocks:
@@ -412,7 +564,13 @@ class GPT(nn.Module):
         return c * mx.tanh(logits / c)
 
     def __call__(self, input_ids: mx.array) -> mx.array:
-        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        input_ids = input_ids.astype(mx.int32)
+        x = self.tok_emb(input_ids).astype(COMPUTE_DTYPE)
+        if self.bigram is not None:
+            x = x + self.bigram(input_ids).astype(x.dtype)
+        x = rms_norm(x)
+        if self.smear is not None:
+            x = self.smear(x)
         x0 = x
         skips: list[mx.array] = []
 
@@ -431,6 +589,7 @@ class GPT(nn.Module):
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
         # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
         # memory knob on Macs, but the common path is chunk_tokens=0 (single matmul + CE).
+        target_ids = target_ids.astype(mx.int32)
         x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
         y = target_ids.reshape(-1)
         if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
@@ -486,7 +645,9 @@ class SplitOptimizers:
     def __init__(self, model: GPT, args: Hyperparameters):
         self.args = args
         params = dict(tree_flatten(model.parameters()))
-        self.embed_key = "tok_emb.weight"
+        self.embed_keys = ["tok_emb.weight"]
+        if "bigram.embed.weight" in params:
+            self.embed_keys.append("bigram.embed.weight")
         self.matrix_keys = [
             k
             for k, p in params.items()
@@ -497,6 +658,9 @@ class SplitOptimizers:
             for k, p in params.items()
             if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
         ]
+        for key in ("smear.gate", "bigram.scale", "bigram.proj.weight"):
+            if key in params:
+                self.scalar_keys.append(key)
 
         self.muon = Muon(self.matrix_keys, params, args)
         self.adam_embed = optim.Adam(
@@ -520,12 +684,9 @@ class SplitOptimizers:
         updated.update(self.muon.step(params, grads, step=step, lr_mul=lr_mul))
 
         self.adam_embed.learning_rate = self.args.tied_embed_lr * lr_mul
-        updated.update(
-            self.adam_embed.apply_gradients(
-                {self.embed_key: grads[self.embed_key]},
-                {self.embed_key: params[self.embed_key]},
-            )
-        )
+        embed_grads = {k: grads[k] for k in self.embed_keys}
+        embed_params = {k: params[k] for k in self.embed_keys}
+        updated.update(self.adam_embed.apply_gradients(embed_grads, embed_params))
 
         self.adam_scalar.learning_rate = self.args.scalar_lr * lr_mul
         scalar_grads = {k: grads[k] for k in self.scalar_keys}
@@ -722,12 +883,14 @@ def validate_dataset_tokenizer_pair(data_path: str, tokenizer_path: str) -> tupl
     return dataset_dir.name, actual_train_files, expected_train_files
 
 
-def load_validation_tokens(pattern: str, seq_len: int) -> np.ndarray:
+def load_validation_tokens(pattern: str, seq_len: int, token_limit: int = 0) -> np.ndarray:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
     # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
     tokens = np.ascontiguousarray(np.concatenate([load_data_shard(file) for file in files], axis=0))
+    if token_limit > 0:
+        tokens = tokens[: min(tokens.size, token_limit + 1)]
     usable = ((tokens.size - 1) // seq_len) * seq_len
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
@@ -784,8 +947,8 @@ def eval_val(
         chunk = val_tokens[raw_start:raw_end]
         x_np = chunk[:-1].reshape(-1, args.train_seq_len)
         y_np = chunk[1:].reshape(-1, args.train_seq_len)
-        x = mx.array(x_np, dtype=mx.int32)
-        y = mx.array(y_np, dtype=mx.int32)
+        x = mx.array(x_np.astype(np.uint16, copy=False), dtype=mx.uint16)
+        y = mx.array(y_np.astype(np.uint16, copy=False), dtype=mx.uint16)
         chunk_token_count = float(y.size)
         batch_loss = compiled_loss(x, y).astype(mx.float32)
         mx.eval(batch_loss)
@@ -806,6 +969,163 @@ def eval_val(
     bits_per_token = val_loss / math.log(2.0)
     val_bpb = bits_per_token * (total_tokens / total_bytes)
     return val_loss, val_bpb
+
+
+# ==============================================================================
+# N-GRAM EVAL CACHE
+# Builds a running n-gram count table from already-scored validation tokens and
+# interpolates with the neural model's distribution using entropy-adaptive alpha.
+# Backward-looking only — counts only include tokens scored so far.
+# ==============================================================================
+
+class NGramEvalCache:
+    """Dense unigram/bigram + hash-based trigram count tables (CPU/numpy)."""
+
+    def __init__(self, vocab_size: int = 1024, hash_size: int = 1 << 16):
+        self.V = vocab_size
+        self.H = hash_size
+        self.cnt1 = np.zeros(vocab_size, dtype=np.int32)
+        self.cnt2 = np.zeros((vocab_size, vocab_size), dtype=np.int32)   # 4 MB
+        self.cnt3 = np.zeros((hash_size, vocab_size), dtype=np.int16)    # 128 MB
+
+    def update(self, toks: np.ndarray) -> None:
+        """Vectorised count update for a 1-D int32 token array."""
+        np.add.at(self.cnt1, toks, 1)
+        if len(toks) > 1:
+            np.add.at(self.cnt2, (toks[:-1], toks[1:]), 1)
+        if len(toks) > 2:
+            h = (toks[:-2].astype(np.int64) * 1031 + toks[1:-1]) % self.H
+            np.add.at(self.cnt3, (h.astype(np.int32), toks[2:]), 1)
+
+    def probs(self, contexts: np.ndarray) -> np.ndarray:
+        """Return (B, V) float32 smoothed n-gram probability matrix.
+
+        contexts: (B, 2) int32, each row = [prev2, prev1], -1 = unknown.
+        """
+        B, V, H = len(contexts), self.V, self.H
+        total1 = int(self.cnt1.sum())
+        if total1 > 0:
+            p = (self.cnt1.astype(np.float32) + 0.1) / (total1 + 0.1 * V)
+            p = np.tile(p, (B, 1))
+        else:
+            p = np.full((B, V), 1.0 / V, dtype=np.float32)
+
+        # Bigram layer
+        prev1 = contexts[:, 1]
+        valid = prev1 >= 0
+        if valid.any():
+            vi = np.where(valid)[0]
+            bc = self.cnt2[prev1[valid]].astype(np.float32)
+            bt = bc.sum(1, keepdims=True)
+            good = bt.squeeze(1) >= 5
+            if good.any():
+                gi = vi[good]
+                bp = (bc[good] + 0.1) / (bt[good] + 0.1 * V)
+                p[gi] = 0.3 * p[gi] + 0.7 * bp
+
+        # Trigram layer
+        prev2 = contexts[:, 0]
+        valid3 = (prev1 >= 0) & (prev2 >= 0)
+        if valid3.any():
+            vi3 = np.where(valid3)[0]
+            h = (prev2[valid3].astype(np.int64) * 1031 + prev1[valid3]) % H
+            tc = self.cnt3[h.astype(np.int32)].astype(np.float32)
+            tt = tc.sum(1, keepdims=True)
+            good3 = tt.squeeze(1) >= 3
+            if good3.any():
+                gi3 = vi3[good3]
+                tp = (tc[good3] + 0.1) / (tt[good3] + 0.1 * V)
+                p[gi3] = 0.2 * p[gi3] + 0.8 * tp
+
+        return p
+
+
+def _log_softmax_np(x: np.ndarray) -> np.ndarray:
+    xm = x - x.max(-1, keepdims=True)
+    return xm - np.log(np.exp(xm).sum(-1, keepdims=True))
+
+
+def eval_val_ngram(
+    args: Hyperparameters,
+    model,
+    val_tokens: np.ndarray,
+    base_bytes_lut: np.ndarray,
+    has_leading_space_lut: np.ndarray,
+    is_boundary_token_lut: np.ndarray,
+    neural_batch: int = 32,
+) -> tuple[float, float, float]:
+    """Batched-neural + sequential-ngram eval with entropy-adaptive interpolation."""
+    seq_len = args.train_seq_len
+    V = args.vocab_size
+    cache = NGramEvalCache(vocab_size=V)
+
+    total_loss = 0.0
+    total_tokens = 0.0
+    total_bytes = 0.0
+
+    total_seqs = (val_tokens.size - 1) // seq_len
+    t0_ng = time.perf_counter()
+
+    for batch_start in range(0, total_seqs, neural_batch):
+        batch_end = min(batch_start + neural_batch, total_seqs)
+        B = batch_end - batch_start
+
+        # Batched neural forward pass — model is stateless so we can batch freely
+        xs = np.stack([
+            val_tokens[i * seq_len: i * seq_len + seq_len]
+            for i in range(batch_start, batch_end)
+        ]).astype(np.uint16)                                           # (B, T)
+        x_mlx = mx.array(xs)
+        hidden = model(x_mlx)                                          # (B, T, dim)
+        hidden_flat = hidden.reshape(B * seq_len, -1)
+        logits_proj = hidden_flat @ model.tok_emb.weight.astype(hidden_flat.dtype).T
+        logits = model.softcap(logits_proj)                            # (B*T, V)
+        mx.eval(logits)
+        logits_np = np.array(logits.astype(mx.float32)).reshape(B, seq_len, V)  # (B, T, V)
+
+        # Sequential n-gram pass per sequence (cache must update in order)
+        for bi in range(B):
+            seq_idx = batch_start + bi
+            s = seq_idx * seq_len
+            toks_x = val_tokens[s: s + seq_len].astype(np.int32)
+            toks_y = val_tokens[s + 1: s + seq_len + 1].astype(np.int32)
+
+            lp = _log_softmax_np(logits_np[bi])                        # (T, V)
+            pr = np.exp(lp)
+            H_ent = -(pr * lp).sum(-1)                                 # (T,)
+            alpha = 0.05 + 0.55 / (1.0 + np.exp(-2.0 * (H_ent - 4.0)))
+
+            # Within-sequence context only (no cross-doc leakage)
+            ctx = np.full((seq_len, 2), -1, dtype=np.int32)
+            ctx[1:, 1] = toks_x[:-1]   # prev1
+            ctx[2:, 0] = toks_x[:-2]   # prev2
+
+            ng_p = cache.probs(ctx)                                    # (T, V)
+
+            # Scale alpha by cache fullness to avoid blending in uniform noise early
+            cache_scale = min(1.0, float(cache.cnt1.sum()) / 5_000_000.0)
+            alpha = alpha * cache_scale
+
+            final_p = np.clip(
+                (1.0 - alpha[:, None]) * pr + alpha[:, None] * ng_p,
+                1e-10, None,
+            )
+
+            token_loss = -np.log(final_p[np.arange(seq_len), toks_y])
+            total_loss += token_loss.sum()
+            total_tokens += seq_len
+            tb = base_bytes_lut[toks_y].astype(np.float64)
+            tb += (has_leading_space_lut[toks_y] & ~is_boundary_token_lut[toks_x]).astype(np.float64)
+            total_bytes += tb.sum()
+
+            cache.update(np.concatenate([toks_x, toks_y[-1:]]))
+
+    ng_ms = 1000.0 * (time.perf_counter() - t0_ng)
+    val_loss = total_loss / total_tokens
+    val_bpb = (val_loss / math.log(2.0)) * (total_tokens / total_bytes)
+
+    return val_loss, val_bpb, ng_ms
+
 
 # -----------------------------
 # TRAINING
@@ -863,7 +1183,7 @@ def main() -> None:
         args.data_path,
         args.tokenizer_path,
     )
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len, args.val_tokens_limit)
 
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size
@@ -891,6 +1211,14 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        rope_dims=args.rope_dims,
+        ln_scale=args.ln_scale,
+        activation=args.activation,
+        bigram_vocab_size=args.bigram_vocab_size,
+        bigram_dim=args.bigram_dim,
+        trigram=args.trigram,
+        smear_enabled=args.smear_enabled,
+        xsa_last_n=args.xsa_last_n,
     )
     opt = SplitOptimizers(model, args)
 
@@ -934,7 +1262,8 @@ def main() -> None:
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
         f"microbatch_tokens:{args.microbatch_tokens} microbatch_batch_size:{args.microbatch_tokens // args.train_seq_len} "
         f"val_batch_size:{args.val_batch_size} "
-        f"warmup_steps:{args.warmup_steps} max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+        f"warmup_steps:{args.warmup_steps} warmdown_iters:{args.warmdown_iters} "
+        f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log(f"mlx_max_microbatch_tokens:{args.mlx_max_microbatch_tokens}")
     log(
@@ -981,8 +1310,8 @@ def main() -> None:
             )
         warm_val_seqs = min(val_batch_tokens // args.train_seq_len, (val_tokens.size - 1) // args.train_seq_len)
         warm_chunk = val_tokens[: warm_val_seqs * args.train_seq_len + 1]
-        x_val = mx.array(warm_chunk[:-1].reshape(-1, args.train_seq_len), dtype=mx.int32)
-        y_val = mx.array(warm_chunk[1:].reshape(-1, args.train_seq_len), dtype=mx.int32)
+        x_val = mx.array(warm_chunk[:-1].reshape(-1, args.train_seq_len).astype(np.uint16, copy=False), dtype=mx.uint16)
+        y_val = mx.array(warm_chunk[1:].reshape(-1, args.train_seq_len).astype(np.uint16, copy=False), dtype=mx.uint16)
         warm_val_loss = compiled_loss(x_val, y_val)
         mx.eval(warm_val_loss)
         mx.synchronize()
@@ -1011,7 +1340,8 @@ def main() -> None:
             if step % 25 == 0 or last_step:
                 log(
                     f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                    f"train_time:{train_time_ms:.0f}ms step_avg:{train_time_ms / max(step, 1):.2f}ms"
+                    f"train_time:{train_time_ms:.0f}ms step_avg:{train_time_ms / max(step, 1):.2f}ms "
+                    f"lr_mul:{args.lr_mul(step, train_time_ms):.4f}"
                 )
             t0 = time.perf_counter()
         if last_step:
@@ -1043,7 +1373,8 @@ def main() -> None:
         if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None):
             log(
                 f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f} "
-                f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms tok_s:{tok_s:.0f}"
+                f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms "
+                f"tok_s:{tok_s:.0f} lr_mul:{lr_mul:.4f}"
             )
         if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
             stop_after_step = step
@@ -1090,6 +1421,14 @@ def main() -> None:
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
     log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
     log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # N-gram enhanced evaluation
+    ng_val_loss, ng_val_bpb, ng_ms = eval_val_ngram(
+        args, model,
+        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+    )
+    log(f"final_ngram_enhanced val_loss:{ng_val_loss:.4f} val_bpb:{ng_val_bpb:.4f} eval_time:{ng_ms:.0f}ms")
+    log(f"final_ngram_enhanced_exact val_loss:{ng_val_loss:.8f} val_bpb:{ng_val_bpb:.8f}")
 
 
 if __name__ == "__main__":
