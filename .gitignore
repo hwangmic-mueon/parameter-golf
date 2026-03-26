@@ -1,11 +1,30 @@
+# Downloaded data (regenerated at runtime)
 data/tokenizers
-__pycache__/
-.DS_Store
-modded-nanogpt/
-modded-nanogpt
 data/datasets
 data/manifest.json
 data/docs_selected.jsonl
+data/
+
+# Local tool caches
+modded-nanogpt/
+modded-nanogpt
 .mypy_cache/
 .venv
+__pycache__/
+
+# Log directories (local run artifacts)
 logs/
+logs_*/
+
+# Experimental directories
+experiments/
+
+# Model artifacts and binary data files
+*.npz
+*.ptz
+*.bin
+final_model.pt
+final_model.int8.ptz
+
+# macOS
+.DS_Store
