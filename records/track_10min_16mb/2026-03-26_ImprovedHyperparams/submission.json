@@ -1,0 +1,17 @@
+{
+  "run_id": "2026-03-26_ImprovedHyperparams",
+  "author": "michaelhwang",
+  "github_id": "michaelhwang",
+  "val_bpb": null,
+  "bytes_total": null,
+  "date": "2026-03-26",
+  "base": "2026-03-24_XSA-all_FullGPTQ_ParallelMuon_1.1155",
+  "summary": "XSA-all + FullGPTQ int6 + Parallel Muon with improved hyperparameters: MUON_BACKEND_STEPS=10, GPTQ_CALIB_BATCHES=512, LATE_QAT_THRESHOLD=0.20, VE_LAYERS=7,8,9,10",
+  "changes": {
+    "MUON_BACKEND_STEPS": {"from": 5, "to": 10},
+    "GPTQ_CALIB_BATCHES": {"from": 256, "to": 512},
+    "LATE_QAT_THRESHOLD": {"from": 0.15, "to": 0.20},
+    "VE_LAYERS": {"from": "9,10", "to": "7,8,9,10"}
+  },
+  "notes": "All changes are env var overrides; architecture identical to SOTA. Targets the 700KB unused capacity observed in seed7 (15.20MB actual vs 15.9MB target). Requires H100+FA3 to evaluate."
+}

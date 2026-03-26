@@ -1,0 +1,11 @@
+{
+  "run_id": "2026-03-25_NGramCache",
+  "author": "michaelhwang",
+  "github_id": "michaelhwang",
+  "val_bpb": null,
+  "bytes_total": null,
+  "date": "2026-03-25",
+  "base": "2026-03-24_XSA-all_FullGPTQ_ParallelMuon_1.1155",
+  "summary": "XSA-all + FullGPTQ int6 + Parallel Muon + entropy-adaptive online n-gram eval cache",
+  "notes": "Training identical to SOTA base. Final evaluation adds online n-gram interpolation built from val set tokens processed left-to-right. Entropy-adaptive alpha = 0.05 + 0.55/(1+exp(-2*(H-4.0))). Requires H100 run to populate val_bpb."
+}

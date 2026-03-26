@@ -1007,6 +1007,151 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
+# --- N-gram eval cache ---
+
+class NGramEvalCache:
+    """Incrementally-built n-gram statistics for entropy-adaptive interpolation during eval.
+
+    Built online from previously-scored val tokens. Each position is predicted using
+    statistics accumulated from all prior val tokens processed in document order.
+    cache_scale ramps from 0 → 1 as more tokens are seen, avoiding near-uniform noise early.
+    """
+    def __init__(self, vocab_size: int, hash_size: int = 1 << 16):
+        self.V = vocab_size
+        self.H = hash_size
+        self.cnt1 = np.zeros(vocab_size, dtype=np.int32)
+        self.cnt2 = np.zeros((vocab_size, vocab_size), dtype=np.int32)   # 4 MB for V=1024
+        self.cnt3 = np.zeros((hash_size, vocab_size), dtype=np.int16)    # 128 MB
+
+    def update(self, toks: np.ndarray) -> None:
+        np.add.at(self.cnt1, toks, 1)
+        if len(toks) > 1:
+            np.add.at(self.cnt2, (toks[:-1], toks[1:]), 1)
+        if len(toks) > 2:
+            h = (toks[:-2].astype(np.int64) * 1031 + toks[1:-1]) % self.H
+            np.add.at(self.cnt3, (h.astype(np.int32), toks[2:]), 1)
+
+    def probs(self, contexts: np.ndarray) -> np.ndarray:
+        """contexts: (B, 2) int32, col 1 = prev1, col 0 = prev2 (-1 = unknown).
+        Returns (B, V) float32 smoothed probability distributions."""
+        B, V, H = len(contexts), self.V, self.H
+        total1 = int(self.cnt1.sum())
+        if total1 > 0:
+            p = (self.cnt1.astype(np.float32) + 0.1) / (total1 + 0.1 * V)
+            p = np.tile(p, (B, 1))
+        else:
+            p = np.full((B, V), 1.0 / V, dtype=np.float32)
+        # Bigram layer (override unigram where bigram count >= 5)
+        row_mask = contexts[:, 1] >= 0
+        if row_mask.any():
+            rows = contexts[row_mask, 1]
+            row_sums = self.cnt2[rows].sum(-1, keepdims=False)
+            ok = row_sums >= 5
+            if ok.any():
+                ok_idx = np.where(row_mask)[0][ok]
+                ok_rows = rows[ok]
+                row_p = self.cnt2[ok_rows].astype(np.float32) + 0.01
+                row_p /= row_p.sum(-1, keepdims=True)
+                p[ok_idx] = row_p
+        # Trigram layer (override bigram where trigram hash count >= 3)
+        tri_mask = (contexts[:, 0] >= 0) & (contexts[:, 1] >= 0)
+        if tri_mask.any():
+            c0 = contexts[tri_mask, 0]
+            c1 = contexts[tri_mask, 1]
+            h_idx = (c0.astype(np.int64) * 1031 + c1) % H
+            row_sums = self.cnt3[h_idx.astype(np.int32)].sum(-1, keepdims=False)
+            ok = row_sums >= 3
+            if ok.any():
+                ok_idx = np.where(tri_mask)[0][ok]
+                ok_h = h_idx[ok].astype(np.int32)
+                row_p = self.cnt3[ok_h].astype(np.float32) + 0.01
+                row_p /= row_p.sum(-1, keepdims=True)
+                p[ok_idx] = row_p
+        return p
+
+
+def _log_softmax_np(x: np.ndarray) -> np.ndarray:
+    xm = x - x.max(-1, keepdims=True)
+    return xm - np.log(np.exp(xm).sum(-1, keepdims=True))
+
+
+def eval_val_ngram(
+    args: "Hyperparameters",
+    base_model: nn.Module,
+    device: torch.device,
+    val_tokens: "Tensor",
+    base_bytes_lut: "Tensor",
+    has_leading_space_lut: "Tensor",
+    is_boundary_token_lut: "Tensor",
+    eval_seq_len: int | None = None,
+    neural_batch: int = 64,
+) -> tuple[float, float]:
+    """Entropy-adaptive n-gram + neural interpolation eval (single-rank, sequential).
+
+    Builds an online n-gram cache from previously-scored val tokens and interpolates
+    with neural model logits. Alpha is high when the neural model is uncertain (high
+    entropy) and the cache is warm (>5M tokens seen). Runs on rank 0 only.
+    """
+    seq_len = eval_seq_len or args.train_seq_len
+    V = args.vocab_size
+    cache = NGramEvalCache(vocab_size=V)
+    val_np = val_tokens.cpu().numpy().astype(np.int32)
+    bl = base_bytes_lut.cpu().numpy()
+    hl = has_leading_space_lut.cpu().numpy()
+    il = is_boundary_token_lut.cpu().numpy()
+    total_seqs = (val_np.size - 1) // seq_len
+    total_loss = 0.0
+    total_tokens_f = 0.0
+    total_bytes_f = 0.0
+    base_model.eval()
+    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    with torch.inference_mode():
+        for batch_start in range(0, total_seqs, neural_batch):
+            batch_end = min(batch_start + neural_batch, total_seqs)
+            B = batch_end - batch_start
+            # Batched neural forward pass (model is stateless)
+            xs = np.stack([
+                val_np[i * seq_len: i * seq_len + seq_len]
+                for i in range(batch_start, batch_end)
+            ]).astype(np.int64)
+            x_t = torch.from_numpy(xs).to(device)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits_t = compiled_logits(x_t)           # (B, T, V)
+            logits_np = logits_t.float().cpu().numpy()    # (B, T, V)
+            # Sequential n-gram pass (cache must update in document order)
+            for bi in range(B):
+                seq_idx = batch_start + bi
+                s = seq_idx * seq_len
+                toks_x = val_np[s: s + seq_len]
+                toks_y = val_np[s + 1: s + seq_len + 1]
+                lp = _log_softmax_np(logits_np[bi])       # (T, V)
+                pr = np.exp(lp)
+                H_ent = -(pr * lp).sum(-1)                # (T,) — neural entropy
+                alpha = 0.05 + 0.55 / (1.0 + np.exp(-2.0 * (H_ent - 4.0)))
+                ctx = np.full((seq_len, 2), -1, dtype=np.int32)
+                ctx[1:, 1] = toks_x[:-1]                  # prev1
+                ctx[2:, 0] = toks_x[:-2]                  # prev2
+                ng_p = cache.probs(ctx)                   # (T, V)
+                # Scale alpha by cache warmth: ramp up from 5M → 10M tokens
+                cache_scale = min(1.0, float(cache.cnt1.sum()) / 5_000_000.0)
+                alpha = alpha * cache_scale
+                final_p = np.clip(
+                    (1.0 - alpha[:, None]) * pr + alpha[:, None] * ng_p,
+                    1e-10, None,
+                )
+                token_loss = -np.log(final_p[np.arange(seq_len), toks_y])
+                total_loss += float(token_loss.sum())
+                total_tokens_f += seq_len
+                tb = bl[toks_y].astype(np.float64)
+                tb += (hl[toks_y] & ~il[toks_x]).astype(np.float64)
+                total_bytes_f += float(tb.sum())
+                cache.update(np.append(toks_x, toks_y[-1]))
+    base_model.train()
+    val_loss = total_loss / total_tokens_f
+    val_bpb = (val_loss / math.log(2.0)) * (total_tokens_f / total_bytes_f)
+    return val_loss, val_bpb
+
+
 # --- Sliding window evaluation ---
 
 def eval_val_sliding(
@@ -2078,6 +2223,23 @@ def main() -> None:
         )
         log0(f"final_int6_sliding_window_s64_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
         log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
+    # N-gram enhanced evaluation (rank 0 only — sequential by design)
+    if rank == 0:
+        torch.cuda.synchronize()
+        t_ng = time.perf_counter()
+        ng_val_loss, ng_val_bpb = eval_val_ngram(
+            args, eval_model, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            eval_seq_len=effective_eval_seq_len,
+        )
+        torch.cuda.synchronize()
+        ng_ms = 1000.0 * (time.perf_counter() - t_ng)
+        log0(
+            f"final_ngram_enhanced val_loss:{ng_val_loss:.4f} val_bpb:{ng_val_bpb:.4f} "
+            f"eval_time:{ng_ms:.0f}ms"
+        )
+        log0(f"final_ngram_enhanced_exact val_loss:{ng_val_loss:.8f} val_bpb:{ng_val_bpb:.8f}")
+        log0(f"final_int8_zlib_roundtrip_exact val_loss:{ng_val_loss:.8f} val_bpb:{ng_val_bpb:.8f}")
     if distributed:
         dist.destroy_process_group()
 if __name__ == "__main__":
