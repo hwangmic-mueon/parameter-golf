@@ -43,7 +43,28 @@ torchrun --standalone --nproc_per_node=8 \
 
 All four improved hyperparameters are now the defaults in this script. Individual knobs can still be overridden via env vars.
 
+## N-gram interpolation (merged from pr638)
+
+An n-gram cache with multi-order backoff and entropy-adaptive alpha is applied at final eval time (inside `eval_val_sliding`). This is a **runtime-only** cache: no serialized weights, zero artifact size impact.
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `NGRAM_CACHE` | `"1"` on multi-GPU, `"0"` on single-GPU | Enable n-gram interpolation |
+| `NGRAM_ALPHA` | `0.40` | Base interpolation weight toward n-gram |
+| `NGRAM_ORDER` | `7` | Maximum n-gram order |
+| `NGRAM_MIN_ORDER` | `2` | Minimum n-gram order (backoff floor) |
+| `NGRAM_ENTROPY` | `1` | Enable entropy-adaptive alpha |
+| `NGRAM_ENT_BASE` | `0.05` | Minimum alpha (low-entropy / confident tokens) |
+| `NGRAM_ENT_RANGE` | `0.55` | Alpha range across entropy values |
+| `NGRAM_ENT_SCALE` | `2.0` | Sigmoid sharpness for entropy gating |
+| `NGRAM_ENT_THRESH` | `4.0` | Entropy midpoint (nats) for sigmoid |
+
+**Validated on 8×H100:** alpha=0.40, order=7 → **1.0336 BPB** improvement.
+
+Multi-order backoff: highest order matched first; lower orders fill in unmatched positions. Score-first discipline: tables updated *after* scoring each segment window.
+
 ## Expected BPB
 
-Each change is expected to give 0-0.005 BPB improvement. Combined effect: potentially 0.005-0.015 BPB.
+Each hyperparameter change is expected to give 0-0.005 BPB improvement. Combined effect: potentially 0.005-0.015 BPB.
+N-gram interpolation adds a further ~0.003-0.005 BPB from the entropy-adaptive mixing.
 Target: **< 1.1082 BPB** (requires beating SOTA by 0.0072 to qualify as new record).

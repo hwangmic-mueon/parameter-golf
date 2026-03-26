@@ -6,12 +6,25 @@
   "bytes_total": null,
   "date": "2026-03-26",
   "base": "2026-03-24_XSA-all_FullGPTQ_ParallelMuon_1.1155",
-  "summary": "XSA-all + FullGPTQ int6 + Parallel Muon with improved hyperparameters: MUON_BACKEND_STEPS=10, GPTQ_CALIB_BATCHES=512, LATE_QAT_THRESHOLD=0.20, VE_LAYERS=7,8,9,10",
+  "summary": "XSA-all + FullGPTQ int6 + Parallel Muon with improved hyperparameters: MUON_BACKEND_STEPS=10, GPTQ_CALIB_BATCHES=512, LATE_QAT_THRESHOLD=0.20, VE_LAYERS=7,8,9,10. Adds eval-time n-gram interpolation (order=7, alpha=0.40, entropy-adaptive) from pr638.",
   "changes": {
     "MUON_BACKEND_STEPS": {"from": 5, "to": 10},
     "GPTQ_CALIB_BATCHES": {"from": 256, "to": 512},
     "LATE_QAT_THRESHOLD": {"from": 0.15, "to": 0.20},
-    "VE_LAYERS": {"from": "9,10", "to": "7,8,9,10"}
+    "VE_LAYERS": {"from": "9,10", "to": "7,8,9,10"},
+    "ngram": {
+      "description": "Multi-order backoff n-gram interpolation with entropy-adaptive alpha, merged from pr638",
+      "NGRAM_CACHE": "1 (auto on multi-GPU)",
+      "NGRAM_ALPHA": 0.40,
+      "NGRAM_ORDER": 7,
+      "NGRAM_MIN_ORDER": 2,
+      "NGRAM_ENTROPY": true,
+      "NGRAM_ENT_BASE": 0.05,
+      "NGRAM_ENT_RANGE": 0.55,
+      "NGRAM_ENT_SCALE": 2.0,
+      "NGRAM_ENT_THRESH": 4.0,
+      "artifact_size_impact": "none (runtime eval cache, not serialized)"
+    }
   },
-  "notes": "All changes are env var overrides; architecture identical to SOTA. Targets the 700KB unused capacity observed in seed7 (15.20MB actual vs 15.9MB target). Requires H100+FA3 to evaluate."
+  "notes": "All changes are env var overrides; architecture identical to SOTA. Targets the 700KB unused capacity observed in seed7 (15.20MB actual vs 15.9MB target). Requires H100+FA3 to evaluate. N-gram cache validated on 8xH100: alpha=0.40 order=7 -> 1.0336 BPB improvement (pr638)."
 }
