@@ -8,17 +8,25 @@ crashes, and how to configure each GPU tier.
 
 ## GPU Tier Overview
 
-| GPU | Platform | VRAM | Relative speed | Script to use |
-|-----|----------|------|----------------|---------------|
-| T4 | Colab Free, Kaggle Free | 16 GB | ~10x slower than H100 | `train_gpt.py` (root) |
-| P100 | Kaggle Free | 16 GB | ~8x slower than H100 | `train_gpt.py` (root) |
-| A100 40GB | Colab Pro | 40 GB | ~3x slower than H100 | `train_gpt.py` (root) |
-| A10G | Colab Pro+ | 24 GB | ~4x slower than H100 | `train_gpt.py` (root) |
-| H100 SXM | RunPod / cloud | 80 GB | baseline | records script (requires FA3) |
+| GPU | Platform | VRAM | Compute cap | Relative speed | Script to use |
+|-----|----------|------|-------------|----------------|---------------|
+| T4 | Colab Free, Kaggle Free | 16 GB | SM75 | ~10x slower than H100 | `train_gpt.py` (root) |
+| P100 | Kaggle Free | 16 GB | SM60 | ~8x slower than H100 | `train_gpt.py` (root) |
+| A100 40GB | Colab Pro | 40 GB | SM80 | ~3x slower than H100 | `train_gpt.py` (root) |
+| A10G | Colab Pro+ | 24 GB | SM86 | ~4x slower than H100 | `train_gpt.py` (root) |
+| RTX PRO 6000 Blackwell | Colab "H100" (sometimes) | 96 GB | SM120 | ~2–4x slower than H100 (eager-only) | `train_gpt.py` (root) |
+| H100 SXM | RunPod / cloud | 80 GB | SM90 | baseline | records script (requires FA3) |
 
 **Rule of thumb:** T4 and P100 are only useful for verifying the pipeline does
 not crash. A100 can produce a meaningful but non-competitive BPB. H100 (ideally
 8x) is required for a real leaderboard submission.
+
+**Colab "H100" tier caveat:** Colab's "H100 GPU" runtime option does not
+always allocate an actual H100. It may allocate an NVIDIA RTX PRO 6000 Blackwell
+Server Edition (SM120). The Blackwell has more VRAM (96 GB) but requires
+different configuration — FA3 is not usable and torch.compile must be disabled.
+Always check compute capability at the start of a session, not the GPU name
+string.
 
 ---
 
@@ -28,8 +36,8 @@ There are two different training scripts in this repo:
 
 | Script | Where | Use when |
 |--------|-------|----------|
-| `train_gpt.py` (repo root) | Root of repo | T4, P100, A100 — any non-H100 GPU |
-| `records/track_10min_16mb/2026-03-26_ImprovedHyperparams/train_gpt.py` | Records folder | H100 only |
+| `train_gpt.py` (repo root) | Root of repo | T4, P100, A100, Blackwell — any non-H100 GPU |
+| `records/track_10min_16mb/2026-03-26_ImprovedHyperparams/train_gpt.py` | Records folder | H100 (SM90) **only** |
 
 **Why they are separate:** The records/SOTA script has a top-level hard import:
 
@@ -40,8 +48,15 @@ from flash_attn_interface import flash_attn_func as flash_attn_3_func
 This line is at module load time (line 27), not behind a try/except. On any GPU
 that does not have Flash Attention 3 installed, the script aborts immediately
 with `ModuleNotFoundError: No module named 'flash_attn_interface'` before a
-single training step runs. FA3 only works on Hopper architecture (H100). T4,
-P100, and A100 will always crash with this script.
+single training step runs. FA3 only works on Hopper architecture (H100, SM90).
+T4, P100, A100, and Blackwell will all crash with this script.
+
+**Important for Blackwell (SM120):** FA3 can be installed (`pip install` succeeds
+and `import flash_attn_interface` works) but crashes at runtime with
+`CUDA error: no kernel image is available for execution on the device`. The FA3
+wheel contains only SM90 kernel binaries — there is no SM120 binary bundled.
+This means even "FA3 available" detection is insufficient; you must gate on
+`cc[0] == 9` (exact Hopper), not `cc[0] >= 9`.
 
 The root `train_gpt.py` uses `torch.nn.functional.scaled_dot_product_attention`
 instead and runs on any CUDA GPU without additional packages.
@@ -244,6 +259,105 @@ The `colab_run.ipynb` Cell 6 sets this automatically for compute_cap < 8.0.
 
 ---
 
+### Issue 9: FA3 runtime crash on Blackwell (SM120) — "no kernel image available"
+
+**Symptom:** FA3 installs and imports successfully, but the first forward pass
+crashes:
+```
+CUDA error: no kernel image is available for execution on the device
+```
+
+**Root cause:** Flash Attention 3 wheels are compiled for H100 (SM90) only. The
+wheel contains a CUDA fat binary with SM90 code only. When PyTorch tries to load
+the kernel on a Blackwell GPU (SM120), CUDA cannot find a compatible image and
+raises this error at runtime, not at import time. Because the crash is a runtime
+error (not an ImportError), the common pattern of checking `fa3_available` via a
+try/except import is insufficient — the import succeeds but execution fails.
+
+**Fix:** Gate FA3 usage on exact compute capability 9, not ≥ 9:
+```python
+cc = torch.cuda.get_device_capability()
+is_hopper_exact = cc[0] == 9          # SM90 only
+is_blackwell_plus = cc[0] >= 12       # SM120+
+
+# Only use FA3 on exact Hopper
+if is_hopper_exact and fa3_available:
+    # Use records script with FA3
+else:
+    # Use root train_gpt.py (PyTorch SDPA)
+```
+
+Never use `cc[0] >= 9` to gate FA3; that incorrectly includes Blackwell.
+
+---
+
+### Issue 10: torch.compile / Triton fails on Blackwell (SM120)
+
+**Symptom:** Training either crashes immediately or produces garbled output with:
+```
+No valid triton configs. OutOfMemoryError: out of resource
+```
+or Triton kernel compilation errors during the first few steps.
+
+**Root cause:** TorchInductor uses Triton to JIT-compile GPU kernels. Triton's
+auto-tuning database contains tile size / warp count configurations tuned for
+known GPU generations. SM120 is too new; Triton has no validated configs for it
+yet. The auto-tuner either picks illegal configs (causing OOM) or finds nothing
+valid. This affects the Newton-Schulz step in the Muon optimizer as well as all
+other compiled kernels.
+
+**Fix:** Set `TORCHDYNAMO_DISABLE=1` before launching torchrun. This disables
+TorchDynamo and TorchInductor entirely, running in PyTorch eager mode:
+```python
+os.environ['TORCHDYNAMO_DISABLE'] = '1'
+```
+
+In eager mode, all operations use PyTorch's built-in CUDA kernels (cuBLAS,
+cuDNN, etc.) which are SM120-compatible via CUDA's PTX JIT path.
+
+**Performance impact:** Without `torch.compile`, the Muon Newton-Schulz
+function runs in eager mode. On Blackwell this costs approximately 4–6× the
+per-step time compared to an H100 with compile:
+- H100 (8x, compiled): ~87 ms/step
+- Blackwell (1x, eager): ~398 ms/step at TRAIN_BATCH_TOKENS=131072
+
+---
+
+### Issue 11: Blackwell model size constraint — int8+zlib budget
+
+**Symptom:** Artifact size check at the end of training reports the model is
+over the 16MB budget with standard configs (e.g., 11L 512d).
+
+**Root cause:** The root `train_gpt.py` uses int8 + zlib compression, not the
+int6 + lzma combination used in the records script. The compression ratio for
+int8+zlib is approximately 0.80 (compressed output is ~80% of the raw int8 byte
+count), whereas int6+lzma achieves roughly 0.59 for the same architecture. This
+means a 26.8M-parameter model (11L 512d) compresses to ~21MB with int8+zlib vs.
+~15.8MB with int6+lzma.
+
+**Size estimates (int8+zlib, compression ratio ≈ 0.80):**
+
+| Config | Params | Estimated compressed | Fits 16MB budget? |
+|--------|--------|----------------------|-------------------|
+| 11L 512d | ~26.8M | ~21.4 MB | No — ~5MB over |
+| 9L 512d | ~21.8M | ~17.4 MB | No — ~1.4MB over |
+| 8L 512d | ~19.4M | ~15.5 MB | Yes |
+| 7L 512d | ~17.0M | ~13.6 MB | Yes — with headroom |
+
+**Fix:** Use 8L 512d as the Blackwell config. This fits within budget with room
+for the `train_gpt.py` code overhead:
+```bash
+NUM_LAYERS=8
+MODEL_DIM=512
+NUM_HEADS=8
+NUM_KV_HEADS=4   # GQA works on Blackwell
+```
+
+This constraint does not apply to the H100 records script, which uses int6+lzma
+and can fit 11L 512d within 16MB.
+
+---
+
 ## Environment Setup: Step by Step
 
 ### Google Colab (T4 Free or A100 Pro)
@@ -307,6 +421,41 @@ ROPE_DIMS=16
 MAX_WALLCLOCK_SECONDS=600
 ```
 
+### Blackwell / RTX PRO 6000 (safe config)
+
+Blackwell is Ampere+ so flash SDPA works, but torch.compile must be disabled.
+GQA works. Model must be ≤ 8L 512d to fit within the int8+zlib 16MB budget.
+
+```bash
+# Required: disable torch.compile (Triton has no SM120 configs yet)
+export TORCHDYNAMO_DISABLE=1
+
+# Model shape — 8L 512d fits 16MB with int8+zlib; GQA works on Blackwell
+NUM_LAYERS=8
+MODEL_DIM=512
+NUM_HEADS=8
+NUM_KV_HEADS=4          # GQA 2:1 — works on Blackwell (not a T4/P100 issue)
+MLP_MULT=3
+
+# Batch sizing — smaller batch gives more steps in eager mode
+TRAIN_BATCH_TOKENS=131072   # 398ms/step → ~1507 steps in 600s
+VAL_BATCH_SIZE=131072
+
+# Architecture features — all safe on Blackwell
+MUON_BACKEND_STEPS=10
+XSA_LAST_N=99
+BIGRAM_VOCAB_SIZE=2048
+SMEAR_ENABLED=1
+LN_SCALE=1
+ROPE_DIMS=16
+
+# Time limit
+MAX_WALLCLOCK_SECONDS=600
+```
+
+Do **not** attempt to install or use FA3 on Blackwell even though `pip install`
+succeeds. FA3 has no SM120 kernel binary — it will crash at runtime.
+
 ### A100 (safe config)
 
 Same as T4/P100 but can afford a larger model and GQA works:
@@ -349,25 +498,31 @@ GPTQ_CALIB_BATCHES=512
 | `TRAIN_BATCH_TOKENS < seq_len * 8` | Any single GPU | `grad_accum_steps=8`, division produces 0 |
 | `TRAIN_SEQ_LEN > 2048` | Any GPU (root script) | Partial RoPE trained at 2048 max; BPB degrades catastrophically beyond training length |
 | `WORLD_SIZE` not in {1,2,4,8} | Any | Script requires `8 % world_size == 0` |
+| FA3 (records script) | Blackwell SM120 | FA3 wheel has SM90 binaries only — runtime crash even though import succeeds |
+| `torch.compile` (no `TORCHDYNAMO_DISABLE`) | Blackwell SM120 | Triton has no tuned configs for SM120; crashes or produces OOM errors |
+| 11L 512d or larger model | Blackwell (root script) | int8+zlib compression at ~0.80 ratio pushes 11L 512d to ~21MB — exceeds 16MB budget |
 
 ---
 
 ## Features Available per Script
 
-| Feature | Root script (T4/P100/A100) | Records script (H100) |
-|---------|---------------------------|----------------------|
-| XSA-all (`XSA_LAST_N`) | Yes | Yes |
-| BigramHash (`BIGRAM_VOCAB_SIZE`) | Yes | Yes |
-| SmearGate (`SMEAR_ENABLED`) | Yes | Yes |
-| Partial RoPE (`ROPE_DIMS`) | Yes | Yes |
-| Muon NS steps (`MUON_BACKEND_STEPS`) | Yes | Yes |
-| Layer-norm scaling (`LN_SCALE`) | Yes | Yes |
-| GQA | A100 only (not T4/P100) | Yes |
-| Value Embeddings (`VE_LAYERS`) | Yes (basic) | Yes (full) |
-| GPTQ int6 + lzma | No (int8 + zlib only) | Yes |
-| Sliding window eval (`EVAL_STRIDE`) | No | Yes |
-| Late QAT (`LATE_QAT_THRESHOLD`) | No | Yes |
-| Flash Attention 3 | No (uses PyTorch SDPA) | Required |
+| Feature | Root script — T4/P100 | Root script — A100 | Root script — Blackwell | Records script — H100 |
+|---------|----------------------|---------------------|------------------------|----------------------|
+| XSA-all (`XSA_LAST_N`) | Yes | Yes | Yes | Yes |
+| BigramHash (`BIGRAM_VOCAB_SIZE`) | Yes | Yes | Yes | Yes |
+| SmearGate (`SMEAR_ENABLED`) | Yes | Yes | Yes | Yes |
+| Partial RoPE (`ROPE_DIMS`) | Yes | Yes | Yes | Yes |
+| Muon NS steps (`MUON_BACKEND_STEPS`) | Yes | Yes | Yes (eager) | Yes |
+| Layer-norm scaling (`LN_SCALE`) | Yes | Yes | Yes | Yes |
+| GQA | No (crashes) | Yes | Yes | Yes |
+| Flash SDPA (PyTorch built-in) | math backend | flash backend | flash backend | N/A (uses FA3) |
+| torch.compile | No (bfloat16 unsupported) | Yes | No (Triton no SM120) | Yes |
+| Value Embeddings (`VE_LAYERS`) | Yes (basic) | Yes (basic) | Yes (basic) | Yes (full) |
+| GPTQ int6 + lzma | No (int8+zlib only) | No (int8+zlib only) | No (int8+zlib only) | Yes |
+| Sliding window eval (`EVAL_STRIDE`) | No | No | No | Yes |
+| Late QAT (`LATE_QAT_THRESHOLD`) | No | No | No | Yes |
+| Flash Attention 3 | No | No | No (runtime crash) | Required |
+| Max model for 16MB budget | ~11L 512d (generous) | ~11L 512d (generous) | 8L 512d (int8+zlib limit) | 11L 512d (int6+lzma) |
 
 ---
 
@@ -376,17 +531,25 @@ GPTQ_CALIB_BATCHES=512
 These are rough ranges based on the model configs in colab_run.ipynb and the
 training throughput of each GPU tier.
 
-| GPU | Config | Tokens processed (10 min) | Expected BPB |
-|-----|--------|--------------------------|--------------|
-| T4 | 6L 384d, MHA | ~600K | 1.5 – 1.7 |
-| P100 | 6L 384d, MHA | ~800K | 1.4 – 1.6 |
-| A100 | 9L 512d, GQA | ~5–8M | 1.2 – 1.35 |
-| H100 SXM (1x) | 11L 512d | ~10M | ~1.25 – 1.35 |
-| H100 SXM (8x) | 11L 512d | ~78M | < 1.12 (SOTA target) |
+| GPU | Config | ms/step | Steps (10 min) | Expected BPB |
+|-----|--------|---------|----------------|--------------|
+| T4 | 6L 384d, MHA | ~800–1000 | ~600–750 | 1.5 – 1.7 |
+| P100 | 6L 384d, MHA | ~600–800 | ~750–1000 | 1.4 – 1.6 |
+| A100 | 9L 512d, GQA | ~300–400 | ~1500–2000 | 1.2 – 1.35 |
+| Blackwell RTX PRO 6000 | 8L 512d, GQA, eager | ~398 | ~1507 | ~1.39 – 1.45 |
+| H100 SXM (1x) | 11L 512d | ~87 | ~6900 | ~1.25 – 1.35 |
+| H100 SXM (8x) | 11L 512d | ~87 | ~6900 | < 1.12 (SOTA target) |
 
 T4/P100 numbers are far from competitive. The model barely converges in 10 minutes
 at these sizes. Use T4/P100 exclusively to confirm the pipeline runs without
 errors before committing GPU time.
+
+The Blackwell RTX PRO 6000 is faster than A100 per step in raw FLOP terms but is
+constrained to eager mode, producing ~398ms/step at TRAIN_BATCH_TOKENS=131072.
+This gives ~1507 steps in 10 minutes and a pre-quantization BPB of approximately
+1.39–1.45 with the 8L 512d config. It is not competitive for leaderboard
+submission but is more useful than A100 for pipeline testing and mid-range
+exploratory runs.
 
 **SOTA context:**
 - Current record (2026-03-24): **1.1154 BPB** on 8xH100 SXM
@@ -422,6 +585,21 @@ If a run crashes on Colab/Kaggle, check in this order:
 7. **Seq len too long** — `TRAIN_SEQ_LEN > 2048` with Partial RoPE causes
    catastrophic BPB degradation (observed: 1.5695 at seq=4096). Keep at 1024 or
    2048 max.
+
+8. **Blackwell: "no kernel image" crash** — If you see
+   `CUDA error: no kernel image is available for execution on the device` on a
+   GPU with compute_cap ≥ 12, FA3 is installed but its SM90 kernel binary cannot
+   run on SM120. Do not use FA3 on Blackwell. Switch to root `train_gpt.py`.
+
+9. **Blackwell: Triton OOM / no valid config** — If torch.compile triggers
+   `No valid triton configs. OutOfMemoryError: out of resource`, set
+   `TORCHDYNAMO_DISABLE=1` before launching torchrun. Triton has no tuned
+   configs for SM120 yet.
+
+10. **Blackwell: artifact over 16MB** — The root script uses int8+zlib
+    (compression ratio ~0.80). A model larger than 8L 512d will exceed the 16MB
+    budget. Reduce `NUM_LAYERS` to 8 or lower. Do not use 11L 512d on the root
+    script.
 
 ---
 
